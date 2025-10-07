@@ -1,146 +1,225 @@
 (function () {
-  'use strict';
-  const uw = typeof unsafeWindow === 'undefined' ? window : unsafeWindow;
+  "use strict";
+  const uw = (typeof unsafeWindow === "undefined") ? window : unsafeWindow;
 
-  // ---------- Identificadores/LS ----------
-  const IDS = {
-    root: 'ae2-panel',
-    head: 'ae2-head',
-    body: 'ae2-body',
-    sendList: 'ae2-send',
-    recvList: 'ae2-recv',
-    wood: 'ae2-wood',
-    stone: 'ae2-stone',
-    silver: 'ae2-silver',
-    intervalMin: 'ae2-interval',
-    dmin: 'ae2-delay-min',
-    dmax: 'ae2-delay-max',
-    start: 'ae2-start',
-    stop: 'ae2-stop',
-    status: 'ae2-status',
-    apiBadge: 'ae2-api'
-  };
-  const LS = {
-    send: 'ae2.send',
-    recv: 'ae2.recv',
-    wood: 'ae2.wood',
-    stone: 'ae2.stone',
-    silver: 'ae2.silver',
-    interval: 'ae2.interval',
-    dmin: 'ae2.dmin',
-    dmax: 'ae2.dmax'
+  // ================== CONFIG: custos de unidades (edite aqui quando quiser) ==================
+  // valores por 1 unidade
+  const UNIT_COSTS = {
+    fundibulario: { wood: 50, stone: 90, iron: 36 },  // exemplo
+    // hoplita:      { wood: X, stone: Y, iron: Z },
+    // arqueiro:     { wood: X, stone: Y, iron: Z },
+    // ...
   };
 
-  // ---------- Estado ----------
-  let running = false;
-  let countdownTimer = null;
+  // ================== Utils ==================
+  const sleep = (ms)=>new Promise(r=>setTimeout(r,ms));
 
-  // ---------- Utils ----------
-  const log = (...a) => console.log('[AER2]', ...a);
-  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-  const randi = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
+  function getCurrentTown() {
+    try { return uw.ITowns?.towns?.[uw.Game?.townId] || null; } catch { return null; }
+  }
+  function getTownId(town){ return +(town?.getId?.() || town?.id || 0); }
+  function getTownName(town){ return town?.getName?.() || town?.name || `Town#${getTownId(town)}`; }
 
-  function getAllPlayerTownIds() {
-    const ids = new Set();
+  // Recursos atuais na cidade (robusto)
+  function getTownResources(town) {
     try {
-      if (uw.ITowns?.getTowns) {
-        const towns = uw.ITowns.getTowns();
-        // pode ser objeto indexado
-        Object.keys(towns || {}).forEach(k => {
-          const t = towns[k];
-          const id = t?.id ?? (typeof t?.getId === 'function' ? t.getId() : null);
-          if (id) ids.add(String(id));
-        });
-      }
-      if (!ids.size && uw.Game?.towns) {
-        Object.keys(uw.Game.towns).forEach(k => ids.add(String(k)));
-      }
-      if (!ids.size && uw.MM?.getCollections?.().Town) {
-        const col = uw.MM.getCollections().Town[0] || uw.MM.getCollections().Town;
-        const list = Array.isArray(col?.models) ? col.models : Array.isArray(col) ? col : [];
-        list.forEach(m => { if (m?.getId) ids.add(String(m.getId())); });
-      }
-    } catch (e) { log('Falha ao ler cidades:', e); }
-    return Array.from(ids);
+      const r = (typeof town.resources === 'function') ? town.resources()
+              : (typeof town.getResources === 'function') ? town.getResources()
+              : (town.resources || {});
+      const wood = Number(r.wood || r.wood_value || 0);
+      const stone = Number(r.stone || r.stone_value || 0);
+      const iron = Number(r.iron || r.silver || r.iron_value || r.silver_value || 0);
+      return { wood, stone, iron };
+    } catch { return { wood:0, stone:0, iron:0 }; }
   }
 
-  function parseIds(str) {
-    return String(str || '')
-      .split(',')
-      .map(s => s.trim())
-      .filter(Boolean)
-      .map(s => s.replace(/\D/g, '')) // apenas dígitos
-      .filter(Boolean);
+  // Capacidade de carga disponível no mercado (robusto)
+  function getAvailableTradeCapacity(town) {
+    try {
+      const byMethod = town?.getAvailableTradeCapacity?.();
+      if (Number.isFinite(byMethod)) return byMethod;
+    } catch {}
+    try {
+      const m = uw.MM?.getModelByNameAndId?.('Town', getTownId(town));
+      const byAttr = m?.attributes?.available_trade_capacity;
+      if (Number.isFinite(byAttr)) return byAttr;
+    } catch {}
+    return 0;
   }
 
-  function setText(id, txt) {
-    const el = document.getElementById(id); if (el) el.textContent = txt;
+  // Envio via gpAjax
+  async function sendTrade({fromTownId, toTownId, wood, stone, iron}) {
+    const data = {
+      wood: Math.max(0, Math.floor(wood)||0),
+      stone: Math.max(0, Math.floor(stone)||0),
+      iron: Math.max(0, Math.floor(iron)||0),
+      id: toTownId,            // destino
+      town_id: fromTownId,     // origem
+      nl_init: true
+    };
+    return new Promise((resolve) => {
+      try {
+        if (uw.gpAjax?.ajaxPost) {
+          uw.gpAjax.ajaxPost("town_info", "trade", data, true, {
+            success: (res)=> resolve({ok:true, res}),
+            error:   (e)=> resolve({ok:false, error:e}),
+            500:     ()=> resolve({ok:false, error:'500'}),
+            404:     ()=> resolve({ok:false, error:'404'}),
+            403:     ()=> resolve({ok:false, error:'403'}),
+            0:       ()=> resolve({ok:false, error:'net'})
+          });
+        } else {
+          console.error("[AutoEnvio] gpAjax não disponível.");
+          resolve({ok:false, error:'gpAjax-missing'});
+        }
+      } catch (e) {
+        resolve({ok:false, error:e});
+      }
+    });
   }
 
-  function badgeAPI(ok) {
-    const el = document.getElementById(IDS.apiBadge);
-    if (!el) return;
-    el.textContent = ok ? 'API: OK' : 'API: aguardando…';
-    el.style.color = ok ? '#22c55e' : '#f59e0b';
+  // Calcula o pacote de envio pela capacidade e custo da unidade
+  function computePayloadByUnit({cap, unitCost, stock}) {
+    const costW = Number(unitCost.wood||0), costS = Number(unitCost.stone||0), costI = Number(unitCost.iron||0);
+    const totalCost = costW + costS + costI;
+    if (totalCost <= 0 || cap <= 0) return {mult:0, wood:0, stone:0, iron:0, totalCost};
+
+    // limite por capacidade de mercado
+    let multByCap = Math.floor(cap / totalCost);
+
+    // limite também pelo estoque disponível (para não pedir mais do que se tem)
+    const mw = costW ? Math.floor((stock.wood||0) / costW) : Infinity;
+    const ms = costS ? Math.floor((stock.stone||0) / costS) : Infinity;
+    const mi = costI ? Math.floor((stock.iron||0) / costI) : Infinity;
+    const mult = Math.max(0, Math.min(multByCap, mw, ms, mi));
+
+    return {
+      mult,
+      wood:  mult * costW,
+      stone: mult * costS,
+      iron:  mult * costI,
+      totalCost
+    };
   }
 
-  // ---------- UI ----------
-  function ensureUI() {
-    if (document.getElementById(IDS.root)) return;
-
-    const css = document.createElement('style');
-    css.textContent = `
-      /* TUDO escopado em #${IDS.root} */
-      #${IDS.root}{
-        --bg:#000000; --card:#1a1a1a; --ink:#e6e6ea; --muted:#a7a9be; --border:#2c2c2c;
-        --brand:#6d28d9; --brand-strong:#4c1d95; --brand-weak:rgba(109,40,217,.16);
-        position:fixed; top:88px; right:16px; z-index:100000; width:320px;
-        font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,sans-serif; color:var(--ink);
-      }
-      #${IDS.root} .card{ background:var(--card); border:3px solid var(--brand-strong);
-        border-radius:12px; box-shadow:0 6px 20px rgba(0,0,0,.35); overflow:hidden; }
-      #${IDS.root} .head{ display:flex; align-items:center; justify-content:space-between;
-        padding:10px 12px; font-weight:800; font-size:14px; border-bottom:1px solid var(--border);
-        background:linear-gradient(180deg, rgba(255,255,255,0.03), rgba(0,0,0,0)); cursor:pointer; user-select:none; }
-      #${IDS.root} .badge{ font-weight:800; font-size:11px; opacity:.9 }
-      #${IDS.root} .body{ padding:12px; display:grid; gap:10px; }
-      #${IDS.root} .row2{ display:grid; grid-template-columns:1fr 1fr; gap:8px; }
-      #${IDS.root} label{ font-size:12px; color:var(--muted); font-weight:600; }
-      #${IDS.root} input{
-        width:100%; padding:8px 10px; border-radius:8px; border:1px solid var(--border);
-        background:#0f1117; color:var(--ink); outline:none; transition:border-color .2s, box-shadow .2s;
-      }
-      #${IDS.root} input:focus{ border-color:var(--brand-strong); box-shadow:0 0 0 3px var(--brand-weak); }
-      #${IDS.root} .btn{
-        width:100%; padding:10px; border-radius:8px; font-weight:800; cursor:pointer;
-        border:1px solid var(--border); background:#12121a; color:var(--ink);
-        transition:transform .08s, box-shadow .15s, border-color .15s, background .15s, opacity .15s;
-        text-shadow:0 1px 1px rgba(0,0,0,.3);
-      }
-      #${IDS.root} .btn:hover{ transform:translateY(-1px); border-color:var(--brand-strong); box-shadow:0 0 0 3px var(--brand-weak); }
-      #${IDS.root} .btn:disabled{ opacity:.55; cursor:not-allowed; transform:none; box-shadow:none; }
-      #${IDS.root} .btn.primary{ background:var(--brand-strong); color:#f5f3ff; border-color:transparent; }
-      #${IDS.root} .btn.primary:hover{ background:var(--brand); box-shadow:0 0 0 3px var(--brand-weak); }
-      #${IDS.root} .muted{ font-size:12px; color:var(--muted); }
-      #${IDS.root} .min{ display:none; }
+  // ================== UI ==================
+  function buildPanel(){
+    const css = `
+      .aeu-panel{position:fixed;z-index:99999;right:14px;top:70px;background:#0f1117;color:#fff;border:2px solid #4c1d95;border-radius:12px;padding:12px;min-width:320px;font:600 12px/1.35 system-ui,Segoe UI,Roboto,sans-serif;box-shadow:0 8px 24px rgba(0,0,0,.35)}
+      .aeu-panel h4{margin:0 0 8px;font-size:14px}
+      .aeu-panel label{display:block;margin:6px 0 2px;font-weight:700;color:#c7c9d1}
+      .aeu-input{width:100%;padding:8px;border-radius:8px;border:1px solid #283044;background:#141923;color:#fff}
+      .aeu-actions{display:flex;gap:8px;margin-top:10px}
+      .aeu-btn{flex:1;cursor:pointer;border:1px solid #39445a;border-radius:10px;padding:8px 10px;text-align:center;background:#2b3444}
+      .aeu-btn.primary{background:#6d28d9}
+      .aeu-note{margin-top:8px;font-weight:400;opacity:.85}
+      .aeu-row{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+      .aeu-muted{opacity:.8}
+      .aeu-hr{border-top:1px solid #2a3240;margin:8px 0}
     `;
-    document.head.appendChild(css);
-
     const root = document.createElement('div');
-    root.id = IDS.root;
-    root.innerHTML = `
-      <div class="card">
-        <div id="${IDS.head}" class="head">
-          <span>Auto Envio de Recursos (v2)</span>
-          <span id="${IDS.apiBadge}" class="badge">API: …</span>
-        </div>
-        <div id="${IDS.body}" class="body min">
-          <div>
-            <label>Cidades que irão enviar (IDs, vírgula) — vazio = todas</label>
-            <input id="${IDS.sendList}" type="text" placeholder="ex.: 1234, 5678"/>
-          </div>
-          <div>
-            <label>Cidades que irão receber (IDs, vírgula)</label>
-            <input id="${IDS.recvList}" type="text" placeholder="ex.: 9999, 1111"/>
-          </div>
-          <div class="r
+    root.innerHTML = `<style>${css}</style>`;
+    document.head.appendChild(root.firstChild);
+
+    const panel = document.createElement('div');
+    panel.className = 'aeu-panel';
+    panel.innerHTML = `
+      <h4>📦 Envio p/ Treino de Unidade</h4>
+      <label>Cidade destino (ID)</label>
+      <input id="aeu-dest" class="aeu-input" placeholder="ex.: 2050">
+      <label>Unidade</label>
+      <select id="aeu-unit" class="aeu-input">
+        ${Object.keys(UNIT_COSTS).map(k=>`<option value="${k}">${k}</option>`).join('')}
+      </select>
+      <div class="aeu-hr"></div>
+      <div class="aeu-row">
+        <div><label>Capacidade (auto)</label><div id="aeu-cap" class="aeu-muted">—</div></div>
+        <div><label>Estoque (auto)</label><div id="aeu-stock" class="aeu-muted">—</div></div>
+      </div>
+      <div class="aeu-row">
+        <div><label>Custo unidade</label><div id="aeu-cost" class="aeu-muted">—</div></div>
+        <div><label>Prévia envio</label><div id="aeu-prev" class="aeu-muted">—</div></div>
+      </div>
+      <div class="aeu-actions">
+        <div class="aeu-btn" id="aeu-preview">Pré-visualizar</div>
+        <div class="aeu-btn primary" id="aeu-send">Calcular & Enviar</div>
+      </div>
+      <div class="aeu-note">Origem: cidade atual. O script limita pelo estoque e pela capacidade de mercado.</div>
+    `;
+    document.body.appendChild(panel);
+
+    // Eventos
+    panel.querySelector('#aeu-preview').addEventListener('click', ()=> updatePreview(false));
+    panel.querySelector('#aeu-send').addEventListener('click', ()=> updatePreview(true));
+  }
+
+  function fmtRes(o){ return `W:${o.wood}|S:${o.stone}|P:${o.iron}`; }
+
+  async function updatePreview(doSend){
+    const town = getCurrentTown();
+    if (!town){ alert('Cidade atual indisponível.'); return; }
+
+    const fromId = getTownId(town);
+    const toId = parseInt(document.getElementById('aeu-dest').value,10);
+    if (!Number.isInteger(toId) || toId<=0){ alert('Informe um ID de cidade destino válido.'); return; }
+
+    const unitKey = String(document.getElementById('aeu-unit').value || '').trim();
+    const unitCost = UNIT_COSTS[unitKey];
+    if (!unitCost){ alert('Unidade desconhecida. Edite UNIT_COSTS no topo do script.'); return; }
+
+    // obtém dados atuais
+    const cap = getAvailableTradeCapacity(town);
+    const stock = getTownResources(town);
+
+    // mostra infos
+    document.getElementById('aeu-cap').textContent = String(cap);
+    document.getElementById('aeu-stock').textContent = fmtRes(stock);
+    document.getElementById('aeu-cost').textContent = fmtRes(unitCost);
+
+    // calcula payload
+    const payload = computePayloadByUnit({cap, unitCost, stock});
+    document.getElementById('aeu-prev').textContent =
+      payload.mult > 0 ? `${payload.mult}x → ${fmtRes(payload)}`
+                       : `não cabe / estoque insuficiente`;
+
+    if (!doSend) return;
+
+    if (payload.mult <= 0){
+      alert('Nada a enviar: capacidade ou estoque insuficiente.');
+      return;
+    }
+
+    // envia
+    const resp = await sendTrade({
+      fromTownId: fromId,
+      toTownId: toId,
+      wood: payload.wood,
+      stone: payload.stone,
+      iron: payload.iron
+    });
+
+    if (resp.ok){
+      alert(`✅ Enviado: ${fmtRes(payload)} (${payload.mult}x ${unitKey})`);
+      // refresh leve (opcional)
+      try{
+        const colTown = uw.MM?.getOnlyCollectionByName?.('Town');
+        if (colTown?.fetch) {
+          await new Promise(res => { const x = colTown.fetch({complete:res, error:res, success:res}); x?.always?.(res); });
+        }
+      }catch{}
+    } else {
+      console.warn('[Envio] Erro:', resp.error || resp.res);
+      alert('❌ Falha no envio. Veja o console.');
+    }
+  }
+
+  // boot
+  (async function boot(){
+    // aguarda objetos do jogo
+    let tries=0;
+    while(!(uw.ITowns && uw.ITowns.towns && uw.Game?.townId) && tries<60){ tries++; await sleep(300); }
+    buildPanel();
+    // pré-preencher destino com cidade atual (pra teste)
+    try{ document.getElementById('aeu-dest').value = String(uw.Game?.townId || ''); }catch{}
+  })();
+})();
